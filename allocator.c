@@ -2,33 +2,78 @@
 #include <stdint.h>
 #include <stddef.h>
 
+/* ---------------------------------------------------------------------------- */
+/*                           Configuration Constants                            */
+/* ---------------------------------------------------------------------------- */
+
+/* Total managed memory in bytes (pool + optional metadata) */
 #define TOTAL_MEMORY   (100u * 1024u)  /* 100 KB */
+
+/* Maximum number of allocation metadata entries */
 #define MAX_NODES      96
+
+/* Bytes required for all metadata entries combined */
 #define NODE_POOL_BYTES  ((uint32_t)(MAX_NODES * (uint32_t)sizeof(alloc_node_t)))
 
+/* ---------------------------------------------------------------------------- */
+/*                              Internal Data Types                             */
+/* ---------------------------------------------------------------------------- */
+
+/*
+ * Allocation tracking entry.
+ * - offset: byte offset from g_mem.raw[] where this block starts
+ * - size:   block size in bytes (0 means metadata slot is unused)
+ * - next:   index of the next allocated block in sorted order (-1 = end of list)
+ */
 typedef struct {
     uint32_t offset;
     uint32_t size;
     int32_t  next;
 } alloc_node_t;
 
+/*
+ * Managed memory pool.
+ * - _align: ensures alignment for any data type
+ * - raw[]:  the actual byte storage
+ */
 typedef union {
-    max_align_t align;
+    max_align_t _align;
     uint8_t     raw[TOTAL_MEMORY];
 } ram_block_t;
 
+/* ---------------------------------------------------------------------------- */
+/*                                 Internal State                               */
+/* ---------------------------------------------------------------------------- */
+
+/* Primary memory pool */
 static ram_block_t g_mem;
+
+/* Pointer to carved metadata area (NULL if uninitialized) */
 static alloc_node_t *node_pool = NULL;
+
+/* Index of first allocated block in sorted list (-1 if empty) */
 static int32_t head_index = -1;
+
+/* Flag: entire memory pool allocated in one block */
 static uint8_t full_taken = 0;
 
+/* ---------------------------------------------------------------------------- */
+/*                                 Internal Helpers                             */
+/* ---------------------------------------------------------------------------- */
+
+/*
+ * ensure_node_pool()
+ * Lazily initializes metadata by carving it from the start of g_mem.raw[].
+ * Called only when first non-special allocation occurs.
+ */
 static void ensure_node_pool(void) {
-    if (node_pool != NULL) return;
-    if (full_taken) return;
-    if (NODE_POOL_BYTES >= TOTAL_MEMORY) return;
+    if (node_pool != NULL) return;                  /* already initialized */
+    if (full_taken) return;                         /* can't carve if full buffer taken */
+    if (NODE_POOL_BYTES >= TOTAL_MEMORY) return;    /* not enough space */
 
     node_pool = (alloc_node_t*)(void*)g_mem.raw;
 
+    /* Mark all metadata slots as unused */
     for (uint32_t i = 0; i < MAX_NODES; ++i) {
         node_pool[i].offset = 0;
         node_pool[i].size   = 0;
@@ -37,6 +82,10 @@ static void ensure_node_pool(void) {
     head_index = -1;
 }
 
+/*
+ * node_slot_alloc()
+ * Returns index of a free metadata slot, or -1 if none are available.
+ */
 static int32_t node_slot_alloc(void) {
     for (uint32_t i = 0; i < MAX_NODES; ++i) {
         if (node_pool[i].size == 0) return (int32_t)i;
@@ -44,6 +93,10 @@ static int32_t node_slot_alloc(void) {
     return -1;
 }
 
+/*
+ * list_insert_sorted()
+ * Inserts node 'idx' into the linked list of allocations, keeping order by offset.
+ */
 static void list_insert_sorted(int32_t idx) {
     if (head_index == -1 || node_pool[idx].offset < node_pool[head_index].offset) {
         node_pool[idx].next = head_index;
@@ -59,6 +112,11 @@ static void list_insert_sorted(int32_t idx) {
     node_pool[prev].next = idx;
 }
 
+/*
+ * list_remove_by_offset()
+ * Removes the block starting at 'off' from the list.
+ * Returns the metadata index, or -1 if not found.
+ */
 static int32_t list_remove_by_offset(uint32_t off) {
     int32_t prev = -1;
     int32_t cur = head_index;
@@ -75,21 +133,31 @@ static int32_t list_remove_by_offset(uint32_t off) {
     return -1;
 }
 
+/*
+ * try_uncarve_when_empty()
+ * Resets node_pool to NULL when all allocations are freed.
+ */
 static void try_uncarve_when_empty(void) {
-    if (head_index != -1) return;
+    if (head_index != -1) return; /* still in use */
     node_pool = NULL;
 }
+
+/* ---------------------------------------------------------------------------- */
+/*                              Public API Implementation                       */
+/* ---------------------------------------------------------------------------- */
 
 int *allocate(int size) {
     if (size <= 0) return NULL;
     uint32_t req = (uint32_t)size;
 
+    /* Special case: allocate entire pool */
     if (req == TOTAL_MEMORY) {
         if (full_taken || node_pool != NULL || head_index != -1) return NULL;
         full_taken = 1;
         return (int*)(void*)&g_mem.raw[0];
     }
 
+    /* Pool is fully taken — no further allocations */
     if (full_taken) return NULL;
 
     ensure_node_pool();
@@ -139,7 +207,7 @@ int *allocate(int size) {
         }
     }
 
-    return NULL;
+    return NULL; /* no suitable space */
 }
 
 void deallocate(int *ptr) {
@@ -148,6 +216,7 @@ void deallocate(int *ptr) {
 
     if (p < g_mem.raw || p >= (g_mem.raw + TOTAL_MEMORY)) return;
 
+    /* Special case: freeing full buffer */
     if (full_taken && p == &g_mem.raw[0]) {
         full_taken = 0;
         return;
@@ -157,11 +226,13 @@ void deallocate(int *ptr) {
 
     uint32_t off = (uint32_t)(p - g_mem.raw);
     int32_t idx = list_remove_by_offset(off);
-    if (idx < 0) return;
+    if (idx < 0) return; /* invalid */
 
+    /* Mark slot as free */
     node_pool[idx].size   = 0;
     node_pool[idx].offset = 0;
 
+    /* If nothing left, release metadata */
     if (head_index == -1) {
         try_uncarve_when_empty();
     }
