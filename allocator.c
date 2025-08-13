@@ -79,3 +79,90 @@ static void try_uncarve_when_empty(void) {
     if (head_index != -1) return;
     node_pool = NULL;
 }
+
+int *allocate(int size) {
+    if (size <= 0) return NULL;
+    uint32_t req = (uint32_t)size;
+
+    if (req == TOTAL_MEMORY) {
+        if (full_taken || node_pool != NULL || head_index != -1) return NULL;
+        full_taken = 1;
+        return (int*)(void*)&g_mem.raw[0];
+    }
+
+    if (full_taken) return NULL;
+
+    ensure_node_pool();
+    if (node_pool == NULL) return NULL;
+
+    const uint32_t USABLE_BASE  = NODE_POOL_BYTES;
+    const uint32_t USABLE_LIMIT = TOTAL_MEMORY; /* exclusive */
+
+    /* Case 1: no allocations yet */
+    if (head_index == -1) {
+        if (USABLE_BASE + req <= USABLE_LIMIT) {
+            int32_t idx = node_slot_alloc();
+            if (idx < 0) return NULL;
+            node_pool[idx].offset = USABLE_BASE;
+            node_pool[idx].size   = req;
+            list_insert_sorted(idx);
+            return (int*)(void*)(&g_mem.raw[node_pool[idx].offset]);
+        }
+        return NULL;
+    }
+
+    /* Case 2: gap before first allocation */
+    {
+        uint32_t first_off = node_pool[head_index].offset;
+        if (first_off >= USABLE_BASE + req) {
+            int32_t idx = node_slot_alloc();
+            if (idx < 0) return NULL;
+            node_pool[idx].offset = USABLE_BASE;
+            node_pool[idx].size   = req;
+            list_insert_sorted(idx);
+            return (int*)(void*)(&g_mem.raw[node_pool[idx].offset]);
+        }
+    }
+
+    /* Case 3: gaps between existing blocks */
+    for (int32_t cur = head_index; cur != -1; cur = node_pool[cur].next) {
+        int32_t nxt = node_pool[cur].next;
+        uint32_t gap_start = node_pool[cur].offset + node_pool[cur].size;
+        uint32_t gap_end   = (nxt == -1) ? USABLE_LIMIT : node_pool[nxt].offset;
+        if (gap_end > gap_start && (gap_end - gap_start) >= req) {
+            int32_t idx = node_slot_alloc();
+            if (idx < 0) return NULL;
+            node_pool[idx].offset = gap_start;
+            node_pool[idx].size   = req;
+            list_insert_sorted(idx);
+            return (int*)(void*)(&g_mem.raw[node_pool[idx].offset]);
+        }
+    }
+
+    return NULL;
+}
+
+void deallocate(int *ptr) {
+    if (!ptr) return;
+    uint8_t *p = (uint8_t*)(void*)ptr;
+
+    if (p < g_mem.raw || p >= (g_mem.raw + TOTAL_MEMORY)) return;
+
+    if (full_taken && p == &g_mem.raw[0]) {
+        full_taken = 0;
+        return;
+    }
+
+    if (node_pool == NULL) return;
+
+    uint32_t off = (uint32_t)(p - g_mem.raw);
+    int32_t idx = list_remove_by_offset(off);
+    if (idx < 0) return;
+
+    node_pool[idx].size   = 0;
+    node_pool[idx].offset = 0;
+
+    if (head_index == -1) {
+        try_uncarve_when_empty();
+    }
+}
