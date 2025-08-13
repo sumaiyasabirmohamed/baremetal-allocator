@@ -1,3 +1,13 @@
+/**
+ * @file allocator.c
+ * @brief Implementation of a simple fixed-size memory pool allocator for
+ *        bare-metal environments.
+ *
+ * This file contains the definitions for memory allocation and deallocation
+ * using a statically allocated pool with optional metadata tracking.
+ * It is intended for systems without a standard heap manager.
+ */
+
 #include "allocator.h"
 #include <stdint.h>
 #include <stddef.h>
@@ -6,24 +16,38 @@
 /*                           Configuration Constants                            */
 /* ---------------------------------------------------------------------------- */
 
-/* Total managed memory in bytes (pool + optional metadata) */
-#define TOTAL_MEMORY   (100u * 1024u)  /* 100 KB */
+/**
+ * @def TOTAL_MEMORY
+ * @brief Total managed memory in bytes (pool + optional metadata).
+ */
+#define TOTAL_MEMORY   (100u * 1024u)  /**< 100 KB */
 
-/* Maximum number of allocation metadata entries */
+/**
+ * @def MAX_NODES
+ * @brief Maximum number of allocation metadata entries.
+ */
 #define MAX_NODES      96
 
-/* Bytes required for all metadata entries combined */
+/**
+ * @def NODE_POOL_BYTES
+ * @brief Bytes required for all metadata entries combined.
+ */
 #define NODE_POOL_BYTES  ((uint32_t)(MAX_NODES * (uint32_t)sizeof(alloc_node_t)))
 
 /* ---------------------------------------------------------------------------- */
 /*                              Internal Data Types                             */
 /* ---------------------------------------------------------------------------- */
 
-/*
- * Allocation tracking entry.
- * - offset: byte offset from g_mem.raw[] where this block starts
- * - size:   block size in bytes (0 means metadata slot is unused)
- * - next:   index of the next allocated block in sorted order (-1 = end of list)
+/**
+ * @struct alloc_node_t
+ * @brief Allocation tracking entry.
+ *
+ * @var alloc_node_t::offset
+ *      Byte offset from g_mem.raw[] where this block starts.
+ * @var alloc_node_t::size
+ *      Block size in bytes (0 means metadata slot is unused).
+ * @var alloc_node_t::next
+ *      Index of the next allocated block in sorted order (-1 = end of list).
  */
 typedef struct {
     uint32_t offset;
@@ -31,10 +55,14 @@ typedef struct {
     int32_t  next;
 } alloc_node_t;
 
-/*
- * Managed memory pool.
- * - _align: ensures alignment for any data type
- * - raw[]:  the actual byte storage
+/**
+ * @union ram_block_t
+ * @brief Managed memory pool.
+ *
+ * @var ram_block_t::_align
+ *      Ensures alignment for any data type.
+ * @var ram_block_t::raw
+ *      The actual byte storage.
  */
 typedef union {
     max_align_t _align;
@@ -45,26 +73,28 @@ typedef union {
 /*                                 Internal State                               */
 /* ---------------------------------------------------------------------------- */
 
-/* Primary memory pool */
+/** Primary memory pool. */
 static ram_block_t g_mem;
 
-/* Pointer to carved metadata area (NULL if uninitialized) */
+/** Pointer to carved metadata area (NULL if uninitialized). */
 static alloc_node_t *node_pool = NULL;
 
-/* Index of first allocated block in sorted list (-1 if empty) */
+/** Index of first allocated block in sorted list (-1 if empty). */
 static int32_t head_index = -1;
 
-/* Flag: entire memory pool allocated in one block */
+/** Flag indicating the entire memory pool is allocated in one block. */
 static uint8_t full_taken = 0;
 
 /* ---------------------------------------------------------------------------- */
 /*                                 Internal Helpers                             */
 /* ---------------------------------------------------------------------------- */
 
-/*
- * ensure_node_pool()
- * Lazily initializes metadata by carving it from the start of g_mem.raw[].
- * Called only when first non-special allocation occurs.
+/**
+ * @brief Lazily initializes metadata by carving it from the start of g_mem.raw[].
+ *
+ * Called only when the first non-special allocation occurs.
+ * If the full memory pool is already taken or there is insufficient space,
+ * metadata is not initialized.
  */
 static void ensure_node_pool(void) {
     if (node_pool != NULL) return;                  /* already initialized */
@@ -82,9 +112,10 @@ static void ensure_node_pool(void) {
     head_index = -1;
 }
 
-/*
- * node_slot_alloc()
- * Returns index of a free metadata slot, or -1 if none are available.
+/**
+ * @brief Returns index of a free metadata slot.
+ *
+ * @return Index of a free metadata slot, or -1 if none are available.
  */
 static int32_t node_slot_alloc(void) {
     for (uint32_t i = 0; i < MAX_NODES; ++i) {
@@ -93,9 +124,10 @@ static int32_t node_slot_alloc(void) {
     return -1;
 }
 
-/*
- * list_insert_sorted()
- * Inserts node 'idx' into the linked list of allocations, keeping order by offset.
+/**
+ * @brief Inserts a node into the linked list of allocations in offset order.
+ *
+ * @param idx Index of the metadata node to insert.
  */
 static void list_insert_sorted(int32_t idx) {
     if (head_index == -1 || node_pool[idx].offset < node_pool[head_index].offset) {
@@ -112,10 +144,11 @@ static void list_insert_sorted(int32_t idx) {
     node_pool[prev].next = idx;
 }
 
-/*
- * list_remove_by_offset()
- * Removes the block starting at 'off' from the list.
- * Returns the metadata index, or -1 if not found.
+/**
+ * @brief Removes the block starting at a given offset from the list.
+ *
+ * @param off Offset of the block in bytes from g_mem.raw[].
+ * @return Index of the metadata entry removed, or -1 if not found.
  */
 static int32_t list_remove_by_offset(uint32_t off) {
     int32_t prev = -1;
@@ -133,9 +166,8 @@ static int32_t list_remove_by_offset(uint32_t off) {
     return -1;
 }
 
-/*
- * try_uncarve_when_empty()
- * Resets node_pool to NULL when all allocations are freed.
+/**
+ * @brief Resets node_pool to NULL when all allocations are freed.
  */
 static void try_uncarve_when_empty(void) {
     if (head_index != -1) return; /* still in use */
@@ -146,6 +178,16 @@ static void try_uncarve_when_empty(void) {
 /*                              Public API Implementation                       */
 /* ---------------------------------------------------------------------------- */
 
+/**
+ * @brief Allocates a block of memory from the static memory pool.
+ *
+ * @param size Number of bytes to allocate (must be > 0).
+ * @return Pointer to allocated memory (aligned to sizeof(int)), or NULL if
+ *         allocation fails (insufficient space or invalid request).
+ *
+ * @note If the request size equals TOTAL_MEMORY, the allocator will
+ *       bypass metadata tracking and give the whole pool.
+ */
 int *allocate(int size) {
     if (size <= 0) return NULL;
     uint32_t req = (uint32_t)size;
@@ -210,6 +252,13 @@ int *allocate(int size) {
     return NULL; /* no suitable space */
 }
 
+/**
+ * @brief Frees a previously allocated memory block.
+ *
+ * @param ptr Pointer returned by allocate().
+ *
+ * @note If freeing the full pool allocation, metadata tracking is not restored.
+ */
 void deallocate(int *ptr) {
     if (!ptr) return;
     uint8_t *p = (uint8_t*)(void*)ptr;
